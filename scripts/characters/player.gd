@@ -21,8 +21,14 @@ extends CharacterBody3D
 @onready var _spring: SpringArm3D = $CamPivot/SpringArm3D
 @onready var _anim: AnimationPlayer = find_child("AnimationPlayer", true, false)
 
+
+## D3.3: when true an external system (the stair cinematic) owns the player transform; the solver + input
+## bow out so they don't fight the choreographed move. The cinematic also disables _physics_process directly
+## as a hard stop; this flag is the soft guard so any stray frame is a no-op.
+var cinematic_lock := false
+
 var _tree: AnimationTree
-var _blend := 0.0 
+var _blend := 0.0
 var _pitch := -0.35
 var _using_gamepad := false
 var _cam_cooldown := 0.0
@@ -41,6 +47,9 @@ const PROBE_UP := 3.0          # floor pick reaches only this far ABOVE the feet
 const PROBE_DOWN := 5.0        # ...and only this far below. Past it = no floor near -> FALL (gravity) until caught.
 const WALL_PROBE_H := 3.0      # wall-check ray runs at FOOT level (this far above feet): blocks walls rising from
 const WALL_LOOKAHEAD := 3.0    # the floor (fence/behind-house/body base) but passes UNDER overhangs (the body).
+const STEP_UP := 9.0           # max height of a wall tri we will STEP OVER if walkable floor sits just above it
+                               # (DC1 dungeon stair risers + low cave skirts ~5-8u). Taller => a real wall, blocks.
+const STEP_PROBE_AHEAD := 6.0  # how far ahead to sample for the step-up landing floor (a bit past the wall face).
 @export var floor_ease := 40.0 # rate (u/s) the body eases onto a near floor; a real fall snaps on landing.
 
 func _ready() -> void:
@@ -100,6 +109,8 @@ func _process(delta: float) -> void:
 		_centering = false
 
 func _physics_process(delta: float) -> void:
+	if cinematic_lock:
+		return                              # the stair cinematic owns the transform during a descend/ascent
 	var move := Input.get_vector("move_left", "move_right", "move_up", "move_down")
 	var mag := minf(move.length(), 1.0)
 	var goal_speed := _goal_speed(mag, _using_gamepad, Input.is_action_pressed("run"))
@@ -117,6 +128,7 @@ func _physics_process(delta: float) -> void:
 	# DC1 solver: step horizontally unless an authored WALL blocks at FOOT level; then settle onto a near floor
 	# (walk) or FALL (gravity) to the ground below. The hit-poly (atari) hull supplies both the floor and the walls.
 	var cur := global_position
+	var stepped := false
 	if hv.length() > 0.5:
 		var sv := hv * delta
 		for m in [sv, Vector3(sv.x, 0.0, 0.0), Vector3(0.0, 0.0, sv.z)]:   # full move, then wall-slide on X / Z
@@ -125,8 +137,13 @@ func _physics_process(delta: float) -> void:
 			if _wall_ahead(m):
 				continue                          # blocked ONLY by an authored WALL at foot level
 			cur.x += m.x; cur.z += m.z            # otherwise step -- even off an edge; gravity drops us to the ground
+			stepped = true
 			break
-	var g := _floor_at(cur.x, cur.z, cur.y)
+	# floor pick: normally reaches PROBE_UP above the feet (nearest floor, no overhead grab). When we actually
+	# STEPPED this frame, reach up to STEP_UP so the body can ease ONTO a stair riser / low skirt it stepped to
+	# (the climb _wall_ahead already cleared). The ease rate caps the rise, so this never teleports him upward.
+	var up_reach := (STEP_UP if stepped else PROBE_UP)
+	var g := _floor_at_reach(cur.x, cur.z, cur.y, up_reach)
 	if not g.is_empty() and absf((g["normal"] as Vector3).y) >= FLOOR_NY:
 		var fl: float = g["position"].y
 		if velocity.y < -1.0 and fl < cur.y - 0.5:
@@ -145,6 +162,7 @@ func _physics_process(delta: float) -> void:
 	# turn the model to face the move direction
 	if dir.length() > 0.01:
 		_model.rotation.y = lerp_angle(_model.rotation.y, atan2(dir.x, dir.z), turn_speed * delta)
+
 
 	# camera auto-trails behind you while moving unless you've recently turned it yourself.
 	_cam_cooldown = maxf(_cam_cooldown - delta, 0.0)
@@ -228,7 +246,11 @@ func _set_first_person(on: bool) -> void:
 ## (incl. "position" + "normal") or {} when nothing is below — the heart of the DC1-style PickUpPoly solver:
 ## the floor is whatever the ray lands on, and its NORMAL says whether that triangle is walkable or a wall.
 func _floor_at(x: float, z: float, ref_y: float) -> Dictionary:
-	var q := PhysicsRayQueryParameters3D.create(Vector3(x, ref_y + PROBE_UP, z), Vector3(x, ref_y - PROBE_DOWN, z))
+	return _floor_at_reach(x, z, ref_y, PROBE_UP)
+
+## As _floor_at but with a caller-chosen UP reach (PROBE_UP normally; STEP_UP on a step-up frame).
+func _floor_at_reach(x: float, z: float, ref_y: float, up: float) -> Dictionary:
+	var q := PhysicsRayQueryParameters3D.create(Vector3(x, ref_y + up, z), Vector3(x, ref_y - PROBE_DOWN, z))
 	q.exclude = [get_rid()]
 	return get_world_3d().direct_space_state.intersect_ray(q)   # {} when nothing below
 
@@ -240,9 +262,35 @@ func _wall_ahead(m: Vector3) -> bool:
 	var dir := Vector3(m.x, 0.0, m.z)
 	if dir.length() < 0.001:
 		return false
+	var nd := dir.normalized()
 	var a := global_position + Vector3.UP * WALL_PROBE_H
-	var b := a + dir.normalized() * (m.length() + WALL_LOOKAHEAD)
+	var b := a + nd * (m.length() + WALL_LOOKAHEAD)
 	var q := PhysicsRayQueryParameters3D.create(a, b)
 	q.exclude = [get_rid()]
 	var h := get_world_3d().direct_space_state.intersect_ray(q)
-	return not h.is_empty() and absf((h["normal"] as Vector3).y) < FLOOR_NY
+	if h.is_empty() or absf((h["normal"] as Vector3).y) >= FLOOR_NY:
+		return false                                   # nothing ahead, or the tri ahead is walkable floor/ramp
+	# A wall tri is ahead. STEP-UP TOLERANCE (real-play fix, bug 1): the DC1 dungeon caves have NO step-climb,
+	# yet the spawn/stair tiles flank the walkable channel with short stair risers + cave skirts authored as
+	# WALL tris. Treat a wall as PASSABLE when there's walkable floor just above it within a step (STEP_UP):
+	# that means it's a low riser/skirt to step ONTO, not a true wall. Sample a down-ray a little past the
+	# wall face, from STEP_UP above the feet; if it lands on walkable floor no higher than a step, let it pass.
+	if _floor_step_ok(nd):
+		return false
+	return true
+
+## Is there walkable floor within STEP_UP just past `nd` (a step we can climb onto)? Probes down from a step
+## above the feet at a point past the wall face; returns true only if it lands on a walkable tri whose Y is
+## between (feet - a little) and (feet + STEP_UP). Tall cave walls have no such near floor -> they still block.
+func _floor_step_ok(nd: Vector3) -> bool:
+	var feet := global_position.y
+	var p := global_position + nd * STEP_PROBE_AHEAD
+	var from := Vector3(p.x, feet + STEP_UP, p.z)
+	var to := Vector3(p.x, feet - PROBE_DOWN, p.z)
+	var q := PhysicsRayQueryParameters3D.create(from, to)
+	q.exclude = [get_rid()]
+	var g := get_world_3d().direct_space_state.intersect_ray(q)
+	if g.is_empty() or absf((g["normal"] as Vector3).y) < FLOOR_NY:
+		return false                                   # no floor (or another wall) at step height ahead
+	var fy: float = g["position"].y
+	return fy <= feet + STEP_UP and fy >= feet - PROBE_DOWN

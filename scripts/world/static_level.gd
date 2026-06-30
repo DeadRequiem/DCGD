@@ -1,5 +1,11 @@
 extends Node3D
 
+# DC1 town relight: town geometry is dynamically lit (ambient + max(N.L,0)*lightCol) by the SHADED, shadow-RECEIVING
+# relight shader; the one sun (Light0) casts the real-time shadows it receives. Replace the imported StandardMaterial3D
+# with the relight shader; sky_cycle feeds the dc_* globals + Environment ambient each frame. Interiors keep theirs.
+const RELIGHT_OPAQUE := preload("res://shaders/town_relight.gdshader")
+const RELIGHT_MASK := preload("res://shaders/town_relight_mask.gdshader")
+
 func _ready() -> void:
 	# DC1's real collision is the あたりポリゴン (the baked `CollisionHull` from <id>_col.json): per-triangle
 	# floor/ramp vs wall, authored by the surface NORMAL (floor |ny|≈1, wall |ny|≈0). Stairs are a SMOOTH ramp
@@ -14,6 +20,8 @@ func _ready() -> void:
 	if geom == null:
 		return
 	_apply_glows(geom)   # DC1 torch/fire light-pool quads -> additive blend (black surround vanishes, centre glows)
+	if get_node_or_null("SkyCycle") != null:   # TOWN -> swap geometry to the DC1 per-vertex relight shader
+		_apply_town_relight(geom)
 	var src: Node = geom
 	for n in geom.get_children():
 		if n.has_meta("walk_floor"):
@@ -86,3 +94,23 @@ func _is_glow_texture(tex: Texture2D) -> bool:
 			sum += (c.r + c.g + c.b) / 3.0
 			n += 1
 	return n > 0 and (sum / n) < 0.32   # avg brightness < ~0.32 (80/255) = a dark light-pool/glow texture
+
+## TOWN relight: replace each town geometry surface's lit StandardMaterial3D with the DC1 per-vertex relight shader
+## (opaque, or alpha-cutout for MASK/BLEND), carrying over the texture. Skips additive glow quads (_apply_glows ran
+## first). Interiors don't call this. The dc_* light globals are driven by sky_cycle each frame.
+func _apply_town_relight(geom: Node) -> void:
+	for mi_node in _mesh_instances(geom):
+		var mi := mi_node as MeshInstance3D
+		var m := mi.mesh
+		if m == null:
+			continue
+		for s in m.get_surface_count():
+			var src := mi.get_active_material(s) as BaseMaterial3D
+			if src == null or src.albedo_texture == null:
+				continue   # untextured / non-standard surfaces keep what they have
+			if src.blend_mode == BaseMaterial3D.BLEND_MODE_ADD:
+				continue   # additive light-pool glow (from _apply_glows) — leave it
+			var sm := ShaderMaterial.new()
+			sm.shader = RELIGHT_OPAQUE if src.transparency == BaseMaterial3D.TRANSPARENCY_DISABLED else RELIGHT_MASK
+			sm.set_shader_parameter("tex", src.albedo_texture)
+			mi.set_surface_override_material(s, sm)

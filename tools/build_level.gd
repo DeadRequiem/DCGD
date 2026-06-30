@@ -32,7 +32,7 @@ func build_one(id: String) -> bool:
 	# Each render MDS exports as "<id>_m<k>.glb" (multi-MDS) or "<id>.glb" (single); collision MDS emit no glb.
 	var glbs: Array = []
 	for f in DirAccess.get_files_at("%s%s" % [GEDIT, id]):
-		if String(f).get_extension() == "glb":
+		if String(f).get_extension() == "glb" and not String(f).begins_with(id + "s0") and not String(f).get_basename().ends_with("_s"):   # skip s0* SKY chunks (SkyDome draws those at runtime); they are NOT town geometry
 			glbs.append("%s%s/%s" % [GEDIT, id, f])
 	glbs.sort()
 	if glbs.is_empty():
@@ -146,6 +146,11 @@ func build_one(id: String) -> bool:
 			var light := DirectionalLight3D.new(); light.name = "Light%d" % li; li += 1
 			light.light_color = Color(L["color"][0] / 255.0, L["color"][1] / 255.0, L["color"][2] / 255.0)
 			light.light_energy = 2.6 if is_interior else 1.4
+			if not is_interior:
+				light.shadow_enabled = true              # the ONE sun: casts the real-time shadows the relight shader now receives
+				light.directional_shadow_max_distance = 2500.0
+				light.shadow_blur = 0.7
+				light.shadow_bias = 0.06
 			var src := Vector3(L["pos"][0], L["pos"][1], L["pos"][2])
 			if src.length() > 0.01:
 				light.look_at_from_position(src.normalized() * 30.0, Vector3.ZERO, Vector3.UP)
@@ -189,8 +194,9 @@ func build_one(id: String) -> bool:
 				mk.position = Vector3(m["pos"][0], m["pos"][1], m["pos"][2])
 				mk.rotation.y = float(m["rotY"])
 				root.add_child(mk); mk.owner = root
-				if String(m["name"]).begins_with("func_fire"):   # brazier/torch spot -> bake a flame + warm light
-					_bake_fire(root, mk.position)
+				var emit_kind := _emitter_kind(String(m["name"]))   # fire/flame/candle/light -> DC1 emissive+glow+flame
+				if emit_kind != "":
+					_bake_emitter(root, mk.position, emit_kind, not id.begins_with("i"))   # towns gate; interiors stay lit
 			var entry = null
 			for mname in by_name:
 				if String(mname).begins_with("func_mapj"):
@@ -247,7 +253,18 @@ func build_one(id: String) -> bool:
 		sky.name = "SkyCycle"
 		sky.set_script(load("res://scripts/world/sky_cycle.gd"))
 		sky.set("table_path", tt_path)
+		sky.set("town_id", id)   # so SkyCycle can sample this town's sky-dome textures for the gradient
 		root.add_child(sky); sky.owner = root
+		var dome := Node3D.new()
+		dome.name = "SkyDome"
+		dome.set_script(load("res://scripts/world/sky_dome.gd"))
+		dome.set("town_id", id)
+		root.add_child(dome); dome.owner = root
+		var bodies := Node3D.new()
+		bodies.name = "SkyBodies"
+		bodies.set_script(load("res://scripts/world/sky_bodies.gd"))
+		bodies.set("town_id", id)
+		root.add_child(bodies); bodies.owner = root
 
 	var ps := PackedScene.new()
 	if ps.pack(root) != OK:
@@ -275,38 +292,66 @@ func _own_rec(n: Node, r: Node) -> void:
 	for c in n.get_children():
 		_own_rec(c, r)
 
-## Bake an animated flame (additive billboard particles) + a warm point light at a func_fire marker (brazier/
-## torch). Procedural — no texture asset needed; works for every scene's fire markers. Tune the look in-engine.
-func _bake_fire(root: Node3D, pos: Vector3) -> void:
-	var fire := Node3D.new()
-	fire.name = "Fire_%d_%d_%d" % [int(pos.x), int(pos.y), int(pos.z)]
-	fire.position = pos
-	root.add_child(fire); fire.owner = root
+## Map a func_* marker name to an emitter bake style (or "" if it isn't a light emitter).
+func _emitter_kind(mname: String) -> String:
+	if mname.begins_with("func_fire") or mname.begins_with("func_flame"):
+		return "fire"
+	if mname.begins_with("func_candle"):
+		return "candle"
+	if mname.begins_with("func_light"):
+		return "light"
+	return ""
 
-	var light := OmniLight3D.new()
-	light.name = "Light"
-	light.light_color = Color(1.0, 0.6, 0.25)
-	light.light_energy = 2.0
-	light.omni_range = 28.0
-	light.position = Vector3(0, 4, 0)
-	fire.add_child(light); light.owner = root
+## Bake DC1 "object light" at a func_* marker: a flame billboard (fire/candle) or a soft additive glow halo (lamp).
+## DC1 has NO real per-object lights (decomp-confirmed) -- this is the emissive/glow/flame trick, procedural (no
+## texture asset), general for every scene. Nodes are prefixed "Emitter_" so sky_cycle night-gates them in towns;
+## interiors have no SkyCycle, so their lamps/candles stay lit.
+func _bake_emitter(root: Node3D, pos: Vector3, kind: String, gated: bool) -> void:
+	var node := Node3D.new()
+	node.name = "Emitter_%s_%d_%d_%d" % [kind, int(pos.x), int(pos.y), int(pos.z)]
+	node.position = pos
+	node.set_script(load("res://scripts/world/emitter.gd"))   # self-gates day/night (towns); interiors stay lit
+	node.set("gated", gated)
+	root.add_child(node); node.owner = root
+	if kind == "light":
+		_add_glow_halo(node, root)
+	else:
+		_add_flame(node, root, kind == "candle")
 
+## Soft warm additive halo for a lamp (func_light) -- a static billboard, no particles.
+func _add_glow_halo(node: Node3D, root: Node) -> void:
+	var halo := MeshInstance3D.new()
+	halo.name = "Glow"
+	var qm := QuadMesh.new()
+	qm.size = Vector2(4, 4)
+	var dm := StandardMaterial3D.new()
+	dm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	dm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	dm.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	dm.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	dm.albedo_color = Color(1.0, 0.75, 0.4, 0.5)
+	qm.material = dm
+	halo.mesh = qm
+	node.add_child(halo); halo.owner = root
+
+## Animated flame billboard particles (fire/torch, or a smaller dimmer candle). Procedural -- no texture asset.
+func _add_flame(node: Node3D, root: Node, candle: bool) -> void:
 	var flame := GPUParticles3D.new()
 	flame.name = "Flame"
-	flame.amount = 24
-	flame.lifetime = 0.6
+	flame.amount = 8 if candle else 24
+	flame.lifetime = 0.5 if candle else 0.6
 	var pm := ParticleProcessMaterial.new()
 	pm.direction = Vector3(0, 1, 0)
 	pm.spread = 12.0
-	pm.initial_velocity_min = 6.0
-	pm.initial_velocity_max = 12.0
+	pm.initial_velocity_min = 3.0 if candle else 6.0
+	pm.initial_velocity_max = 6.0 if candle else 12.0
 	pm.gravity = Vector3(0, 4, 0)
-	pm.scale_min = 1.5
-	pm.scale_max = 3.0
+	pm.scale_min = 0.5 if candle else 1.5
+	pm.scale_max = 1.0 if candle else 3.0
 	pm.color = Color(1.0, 0.55, 0.15)
 	flame.process_material = pm
 	var qm := QuadMesh.new()
-	qm.size = Vector2(3, 3)
+	qm.size = Vector2(1.2, 1.2) if candle else Vector2(3, 3)
 	var dm := StandardMaterial3D.new()
 	dm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	dm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
@@ -315,4 +360,4 @@ func _bake_fire(root: Node3D, pos: Vector3) -> void:
 	dm.albedo_color = Color(1.0, 0.5, 0.1)
 	qm.material = dm
 	flame.draw_pass_1 = qm
-	fire.add_child(flame); flame.owner = root
+	node.add_child(flame); flame.owner = root

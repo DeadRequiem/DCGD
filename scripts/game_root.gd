@@ -13,6 +13,12 @@ var _return_area := ""         # where an empty-target (return) door sends you b
 var _return_entrance := ""     # the named door node to land back on
 var _current_base := ""        # current area's BASE id (no time suffix) — to re-resolve the variant on a time change
 var _time_label: Label         # DEBUG time-of-day HUD
+var _in_dungeon := false       # the active level is a DungeonRun (procedural), not a baked town/interior area
+
+# D3.5: the dungeon "area" id used by the town's Door_dungeon_0 (target="dungeon") maps to this hosted scene —
+# a DungeonRun that uses the persistent Player rather than its own. The town the dungeon returns to.
+const DUNGEON_SCENE := "res://scenes/dungeons/dungeon.tscn"
+@export var dungeon_return_town := "e01"
 
 func _ready() -> void:
 	add_to_group("game_root")
@@ -72,6 +78,10 @@ func warp_through(door: Node) -> void:
 	if tgt == "":
 		push_warning("warp_through: no destination (no return target set)")
 		return
+	# D3.5: the dungeon door (target="dungeon") swaps to the hosted DungeonRun scene instead of a baked area.
+	if tgt == "dungeon":
+		enter_dungeon()
+		return
 	var path := _resolve_variant(tgt)
 	if path == "":
 		push_warning("warp_through: no built scene for area '%s'" % tgt)
@@ -83,6 +93,31 @@ func warp_through(door: Node) -> void:
 	# happen OUTSIDE any physics/signal callback (Godot forbids removing a CollisionObject mid-callback).
 	load_level.call_deferred(load(path))
 
+# =====================================================================================================
+# D3.5 — dungeon entry / town return (the Atla -> rebuild meta-loop transition through game_root)
+# =====================================================================================================
+
+## Swap to the dungeon (the persistent-Player-hosted DungeonRun). The DungeonRun spawns the player at floor 1's
+## up-stair itself, so we mark _in_dungeon and skip the town spawn-resolve.
+func enter_dungeon() -> void:
+	_in_dungeon = true
+	_current_base = "dungeon"
+	_has_pending = false
+	load_level.call_deferred(load(DUNGEON_SCENE))
+
+## End a dungeon run and return to `town_id` in Rebuild Mode. Called by DungeonRun.exit_to_town after the
+## collected Atla are banked into GeoramaState. The town scene, on load, sees GeoramaState.rebuild_pending and
+## opens the RebuildUI (or we open it here directly once the town is live).
+func return_to_town(town_id := "e01") -> void:
+	_in_dungeon = false
+	var path := _resolve_variant(town_id)
+	if path == "":
+		push_warning("return_to_town: no built scene for town '%s'" % town_id)
+		return
+	_current_base = town_id
+	_has_pending = false
+	load_level.call_deferred(load(path), true)
+
 ## area id -> a built scene path, trying the bare id then the day/time variants (e.g. i01h06 -> i01h06e/m/n).
 func _resolve_variant(area_id: String) -> String:
 	for suffix in [TimeOfDay.suffix(), "", "m", "e", "n", "s", "k"]:
@@ -92,8 +127,9 @@ func _resolve_variant(area_id: String) -> String:
 	return ""
 
 ## Swap the active area. Frees the current one, instances the new, and drops the player at its `Spawn` marker
-## (or, for a warp, the named entrance). `scene` may be a baked area or, later, a generated dungeon floor.
-func load_level(scene: PackedScene) -> void:
+## (or, for a warp, the named entrance). `scene` may be a baked area, a georama town, or the hosted DungeonRun.
+## `open_rebuild` (set by return_to_town) opens the D3.5 Rebuild UI once the town is live + Atla are pending.
+func load_level(scene: PackedScene, open_rebuild := false) -> void:
 	for c in _level_slot.get_children():
 		_level_slot.remove_child(c)
 		c.queue_free()
@@ -103,11 +139,15 @@ func load_level(scene: PackedScene) -> void:
 	_level_slot.add_child(lvl)
 	_current_id = lvl.name
 	await get_tree().physics_frame        # let the new area's collision register before resolving the spawn
-	if _player:
+	# A hosted DungeonRun spawns the player itself (at floor 1's up-stair); don't run the town spawn-resolve.
+	if _player and not _in_dungeon:
 		_player.global_position = _resolve_warp_spawn(lvl) if _has_pending else _resolve_spawn(lvl)
 		_player.velocity = Vector3.ZERO
-		_has_pending = false
+	_has_pending = false
 	_warp_cd = 0.3                        # brief guard so the door you LAND on can't fire on a held/stray press
+	# D3.5: returning to a town with collected Atla -> open the Rebuild UI bound to the town's georama grid.
+	if open_rebuild:
+		_open_rebuild_ui.call_deferred(lvl)
 	# DEBUG collision overlay (press F3 to toggle): GREEN = walkable floor, RED = wall, by the あたりポリゴン normal.
 	var dbg := Node3D.new()
 	dbg.name = "CollisionDebug"
@@ -148,3 +188,28 @@ func _resolve_spawn(lvl: Node) -> Vector3:
 			return best + Vector3(0, 3, 0)
 	var spawn := lvl.get_node_or_null("Spawn") as Node3D
 	return spawn.global_position if spawn != null else Vector3(0, 8, 0)
+
+# =====================================================================================================
+# D3.5 — Rebuild UI hosting
+# =====================================================================================================
+
+## Open the town-rebuild UI bound to `lvl`'s GeoramaGrid (if any Atla are pending). The UI is added under
+## game_root so it survives independent of the swapped level. Returns the created RebuildUI (or null).
+func _open_rebuild_ui(lvl: Node) -> Node:
+	var gs := get_node_or_null("/root/GeoramaState")
+	if gs != null and not gs.rebuild_pending:
+		return null
+	if get_node_or_null("RebuildUI") != null:
+		return get_node("RebuildUI")
+	var grid := lvl.get_node_or_null("GeoramaGrid")
+	var ui = load("res://scripts/ui/rebuild_ui.gd").new()
+	ui.name = "RebuildUI"
+	add_child(ui)
+	if grid != null and ui.has_method("bind"):
+		ui.call("bind", grid)
+	return ui
+
+## The active town's GeoramaGrid (or null when in a dungeon / non-town area). Verification convenience.
+func current_grid() -> Node:
+	var lvl := _level_slot.get_child(0) if _level_slot.get_child_count() > 0 else null
+	return lvl.get_node_or_null("GeoramaGrid") if lvl != null else null
